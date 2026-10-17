@@ -1,7 +1,7 @@
 From 928cabe4fb9fbecd62f33c57888bbba7e894f687 Mon Sep 17 00:00:00 2001
 From: Stella Reine <stella@styna.net>
 Date: Fri, 16 Oct 2026 20:57:29 -0500
-Subject: [PATCH 5/6] ntdll: Export _fltused as data next to the loader debug
+Subject: [PATCH 5/8] ntdll: Export _fltused as data next to the loader debug
  flags.
 
 _fltused was a stub function, so its address pointed into code. FiveM

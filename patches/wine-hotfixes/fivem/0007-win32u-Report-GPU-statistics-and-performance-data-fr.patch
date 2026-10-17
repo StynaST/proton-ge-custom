@@ -1,0 +1,615 @@
+From 6e88e8689df7af1e0d560111384d432006659bfb Mon Sep 17 00:00:00 2001
+From: Stella Reine <stella@styna.net>
+Date: Fri, 16 Oct 2026 23:03:14 -0500
+Subject: [PATCH 7/8] win32u: Report GPU statistics and performance data from
+ host telemetry.
+
+NtGdiDdDDIQueryStatistics now reports adapter, node (3D engine running
+time) and segment (dedicated memory use) statistics, and
+NtGdiDdDDIQueryAdapterInfo supports KMTQAITYPE_ADAPTERPERFDATA
+(temperature, memory clock, power, fan).
+
+Data comes from NVML for NVIDIA GPUs, matched by Vulkan device UUID, or
+from amdgpu-style sysfs and hwmon files. Running time is integrated from
+the sampled utilization.
+---
+ dlls/win32u/Makefile.in      |   1 +
+ dlls/win32u/d3dkmt.c         |  81 +++++++++-
+ dlls/win32u/gpustats.c       | 303 +++++++++++++++++++++++++++++++++++
+ dlls/win32u/tests/d3dkmt.c   |  65 ++++++++
+ dlls/win32u/win32u_private.h |  21 +++
+ include/ddk/d3dkmthk.h       |  24 +++
+ 6 files changed, 493 insertions(+), 2 deletions(-)
+ create mode 100644 dlls/win32u/gpustats.c
+
+diff --git a/dlls/win32u/Makefile.in b/dlls/win32u/Makefile.in
+index d9ae2093bf0..1762be0bb27 100644
+--- a/dlls/win32u/Makefile.in
++++ b/dlls/win32u/Makefile.in
+@@ -31,6 +31,7 @@ SOURCES = \
+ 	font.c \
+ 	freetype.c \
+ 	gdiobj.c \
++	gpustats.c \
+ 	hook.c \
+ 	hwnd_dmabuf.c \
+ 	imm.c \
+diff --git a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+index 484d029a3e8..d827ec0fd5d 100644
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -169,6 +169,7 @@ struct d3dkmt_adapter
+ {
+     struct d3dkmt_object obj;
+     struct vulkan_physical_device *physical_device;
++    LUID luid;
+ };
+ 
+ struct d3dkmt_device
+@@ -624,6 +625,21 @@ static struct vulkan_physical_device *get_vulkan_physical_device( struct vulkan_
+     return NULL;
+ }
+ 
++static BOOL get_luid_gpu_stats( const LUID *luid, struct gpu_stats *stats )
++{
++    VkPhysicalDeviceProperties2 properties2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++    struct vulkan_physical_device *physical_device;
++    struct vulkan_instance *instance;
++    GUID uuid;
++
++    if (!get_gpu_uuid_from_luid( luid, &uuid )) return FALSE;
++    if (!(instance = get_d3dkmt_vulkan_instance())) return FALSE;
++    if (!(physical_device = get_vulkan_physical_device( instance, luid ))) return FALSE;
++
++    instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &properties2 );
++    return get_gpu_stats( &uuid, properties2.properties.vendorID, properties2.properties.deviceID, stats );
++}
++
+ /******************************************************************************
+  *           NtGdiDdDDIOpenAdapterFromLuid    (win32u.@)
+  */
+@@ -636,6 +652,7 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromLuid( D3DKMT_OPENADAPTERFROMLUID *desc
+     if ((status = d3dkmt_object_alloc( sizeof(*adapter), D3DKMT_ADAPTER, (void **)&adapter ))) return status;
+     if ((status = alloc_object_handle( &adapter->obj ))) goto failed;
+ 
++    adapter->luid = desc->AdapterLuid;
+     if (!(instance = get_d3dkmt_vulkan_instance())) WARN( "Vulkan is unavailable.\n" );
+     else adapter->physical_device = get_vulkan_physical_device( instance, &desc->AdapterLuid );
+     if (!adapter->physical_device) WARN( "Failed to find Vulkan physical device\n" );
+@@ -996,6 +1013,28 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
+ 
+         return STATUS_SUCCESS;
+     }
++    case KMTQAITYPE_ADAPTERPERFDATA:
++    {
++        D3DKMT_ADAPTER_PERFDATA *perf = desc->pPrivateDriverData;
++        struct gpu_stats stats;
++
++        if (desc->PrivateDriverDataSize < sizeof(*perf)) return STATUS_INVALID_PARAMETER;
++        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
++        if (perf->PhysicalAdapterIndex) return STATUS_INVALID_PARAMETER;
++        if (!get_luid_gpu_stats( &adapter->luid, &stats ) || !(stats.flags & GPU_STATS_TEMPERATURE))
++            return STATUS_NOT_SUPPORTED;
++
++        perf->MemoryFrequency      = stats.memory_frequency;
++        perf->MaxMemoryFrequency   = stats.max_memory_frequency;
++        perf->MaxMemoryFrequencyOC = stats.max_memory_frequency;
++        perf->MemoryBandwidth      = 0;
++        perf->PCIEBandwidth        = 0;
++        perf->FanRPM               = stats.fan_rpm;
++        perf->Power                = stats.power;
++        perf->Temperature          = stats.temperature;
++        perf->PowerStateOverride   = 0;
++        return STATUS_SUCCESS;
++    }
+     case KMTQAITYPE_UMOPENGLINFO:
+     {
+         static const WCHAR opengl_dll[] = {'o','p','e','n','g','l','3','2','.','d','l','l',0};
+@@ -1025,8 +1064,46 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
+  */
+ NTSTATUS WINAPI NtGdiDdDDIQueryStatistics( D3DKMT_QUERYSTATISTICS *stats )
+ {
+-    FIXME( "(%p): stub\n", stats );
+-    return STATUS_SUCCESS;
++    struct gpu_stats gpu;
++    GUID uuid;
++
++    TRACE( "(%p)\n", stats );
++
++    if (!stats) return STATUS_INVALID_PARAMETER;
++    if (!get_gpu_uuid_from_luid( &stats->AdapterLuid, &uuid )) return STATUS_INVALID_PARAMETER;
++
++    memset( &stats->QueryResult, 0, sizeof(stats->QueryResult) );
++
++    switch (stats->Type)
++    {
++    case D3DKMT_QUERYSTATISTICS_ADAPTER:
++        stats->QueryResult.AdapterInformation.NbSegments = 1;
++        stats->QueryResult.AdapterInformation.NodeCount = 1;
++        stats->QueryResult.AdapterInformation.VidPnSourceCount = 1;
++        return STATUS_SUCCESS;
++
++    case D3DKMT_QUERYSTATISTICS_NODE:
++        if (stats->QueryNode.NodeId) return STATUS_INVALID_PARAMETER;
++        /* system-wide 3D engine running time */
++        if (get_luid_gpu_stats( &stats->AdapterLuid, &gpu ) && (gpu.flags & GPU_STATS_RUNNING_TIME))
++            stats->QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart = gpu.running_time;
++        return STATUS_SUCCESS;
++
++    case D3DKMT_QUERYSTATISTICS_SEGMENT:
++        if (stats->QuerySegment.SegmentId) return STATUS_INVALID_PARAMETER;
++        /* dedicated video memory, used by all processes */
++        if (get_luid_gpu_stats( &stats->AdapterLuid, &gpu ) && (gpu.flags & GPU_STATS_MEMORY))
++        {
++            stats->QueryResult.SegmentInformation.CommitLimit = gpu.vram_total;
++            stats->QueryResult.SegmentInformation.BytesCommitted = gpu.vram_used;
++            stats->QueryResult.SegmentInformation.BytesResident = gpu.vram_used;
++        }
++        return STATUS_SUCCESS;
++
++    default:
++        FIXME( "type %d not implemented.\n", stats->Type );
++        return STATUS_SUCCESS;
++    }
+ }
+ 
+ /******************************************************************************
+diff --git a/dlls/win32u/gpustats.c b/dlls/win32u/gpustats.c
+new file mode 100644
+index 00000000000..3d6bce6aeac
+--- /dev/null
++++ b/dlls/win32u/gpustats.c
+@@ -0,0 +1,303 @@
++/*
++ * Host GPU telemetry for D3DKMT statistics and performance data
++ *
++ * Copyright 2026 FiveM-Linux contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <dirent.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "win32u_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
++
++/* NVML ABI subset, from nvml.h */
++typedef int nvmlReturn_t;
++typedef struct nvmlDevice_st *nvmlDevice_t;
++typedef struct { unsigned int gpu, memory; } nvmlUtilization_t;
++typedef struct { unsigned long long total, free, used; } nvmlMemory_t;
++#define NVML_TEMPERATURE_GPU 0
++#define NVML_CLOCK_MEM 2
++
++static nvmlReturn_t (*p_nvmlInit_v2)(void);
++static nvmlReturn_t (*p_nvmlDeviceGetHandleByUUID)( const char *uuid, nvmlDevice_t *device );
++static nvmlReturn_t (*p_nvmlDeviceGetUtilizationRates)( nvmlDevice_t device, nvmlUtilization_t *util );
++static nvmlReturn_t (*p_nvmlDeviceGetMemoryInfo)( nvmlDevice_t device, nvmlMemory_t *memory );
++static nvmlReturn_t (*p_nvmlDeviceGetTemperature)( nvmlDevice_t device, int sensor, unsigned int *temp );
++static nvmlReturn_t (*p_nvmlDeviceGetFanSpeed)( nvmlDevice_t device, unsigned int *speed );
++static nvmlReturn_t (*p_nvmlDeviceGetPowerUsage)( nvmlDevice_t device, unsigned int *power );
++static nvmlReturn_t (*p_nvmlDeviceGetEnforcedPowerLimit)( nvmlDevice_t device, unsigned int *limit );
++static nvmlReturn_t (*p_nvmlDeviceGetClockInfo)( nvmlDevice_t device, int type, unsigned int *clock );
++static nvmlReturn_t (*p_nvmlDeviceGetMaxClockInfo)( nvmlDevice_t device, int type, unsigned int *clock );
++
++struct gpu_device
++{
++    GUID uuid;
++    UINT vendor, device;
++    nvmlDevice_t nvml;
++    char sysfs[512];        /* DRM device directory, for drivers exposing sysfs telemetry */
++    ULONGLONG last_ns;      /* time of the last utilization sample */
++    ULONGLONG running_time; /* integrated busy time, in 100ns units */
++};
++
++static pthread_mutex_t gpustats_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct gpu_device *devices;
++static UINT device_count;
++
++static ULONGLONG monotonic_ns(void)
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++static void nvml_init_once(void)
++{
++    void *handle;
++
++    if (!(handle = dlopen( "libnvidia-ml.so.1", RTLD_NOW )))
++    {
++        TRACE( "NVML not available: %s\n", dlerror() );
++        return;
++    }
++#define LOAD(f) if (!(p_##f = dlsym( handle, #f ))) goto failed
++    LOAD( nvmlInit_v2 );
++    LOAD( nvmlDeviceGetHandleByUUID );
++    LOAD( nvmlDeviceGetUtilizationRates );
++    LOAD( nvmlDeviceGetMemoryInfo );
++    LOAD( nvmlDeviceGetTemperature );
++#undef LOAD
++    p_nvmlDeviceGetFanSpeed = dlsym( handle, "nvmlDeviceGetFanSpeed" );
++    p_nvmlDeviceGetPowerUsage = dlsym( handle, "nvmlDeviceGetPowerUsage" );
++    p_nvmlDeviceGetEnforcedPowerLimit = dlsym( handle, "nvmlDeviceGetEnforcedPowerLimit" );
++    p_nvmlDeviceGetClockInfo = dlsym( handle, "nvmlDeviceGetClockInfo" );
++    p_nvmlDeviceGetMaxClockInfo = dlsym( handle, "nvmlDeviceGetMaxClockInfo" );
++
++    if (!p_nvmlInit_v2())
++    {
++        TRACE( "NVML initialized.\n" );
++        return;
++    }
++    WARN( "nvmlInit failed.\n" );
++
++failed:
++    p_nvmlInit_v2 = NULL;
++    dlclose( handle );
++}
++
++static BOOL read_sysfs_ulonglong( const char *dir, const char *name, ULONGLONG *value )
++{
++    unsigned long long data;
++    char path[640];
++    FILE *file;
++    BOOL ret;
++
++    snprintf( path, sizeof(path), "%s/%s", dir, name );
++    if (!(file = fopen( path, "r" ))) return FALSE;
++    if ((ret = fscanf( file, "%llu", &data ) == 1)) *value = data;
++    fclose( file );
++    return ret;
++}
++
++/* first hwmon directory of a DRM device */
++static BOOL get_hwmon_dir( const char *device_dir, char *buffer, size_t size )
++{
++    char path[1024];
++    struct dirent *entry;
++    DIR *dir;
++
++    snprintf( path, sizeof(path), "%s/hwmon", device_dir );
++    if (!(dir = opendir( path ))) return FALSE;
++    while ((entry = readdir( dir )))
++    {
++        if (strncmp( entry->d_name, "hwmon", 5 )) continue;
++        snprintf( buffer, size, "%s/%s", path, entry->d_name );
++        closedir( dir );
++        return TRUE;
++    }
++    closedir( dir );
++    return FALSE;
++}
++
++static BOOL read_sysfs_hex( const char *dir, const char *name, unsigned int *value )
++{
++    char path[640];
++    FILE *file;
++    BOOL ret;
++
++    snprintf( path, sizeof(path), "%s/%s", dir, name );
++    if (!(file = fopen( path, "r" ))) return FALSE;
++    ret = fscanf( file, "%x", value ) == 1;
++    fclose( file );
++    return ret;
++}
++
++static void find_sysfs_device( struct gpu_device *gpu )
++{
++    struct dirent *entry;
++    unsigned int vendor, device;
++    char path[sizeof(gpu->sysfs)];
++    DIR *dir;
++
++    if (!(dir = opendir( "/sys/class/drm" ))) return;
++    while ((entry = readdir( dir )))
++    {
++        if (strncmp( entry->d_name, "card", 4 ) || strchr( entry->d_name, '-' )) continue;
++        snprintf( path, sizeof(path), "/sys/class/drm/%s/device", entry->d_name );
++        if (!read_sysfs_hex( path, "vendor", &vendor ) || vendor != gpu->vendor) continue;
++        if (!read_sysfs_hex( path, "device", &device ) || device != gpu->device) continue;
++        snprintf( gpu->sysfs, sizeof(gpu->sysfs), "%s", path );
++        break;
++    }
++    closedir( dir );
++}
++
++static struct gpu_device *get_gpu_device( const GUID *uuid, UINT vendor, UINT device )
++{
++    static pthread_once_t nvml_once = PTHREAD_ONCE_INIT;
++    struct gpu_device *gpu, *tmp;
++    UINT i;
++
++    for (i = 0; i < device_count; i++)
++        if (IsEqualGUID( &devices[i].uuid, uuid )) return &devices[i];
++
++    if (!(tmp = realloc( devices, (device_count + 1) * sizeof(*devices) ))) return NULL;
++    devices = tmp;
++    gpu = &devices[device_count++];
++    memset( gpu, 0, sizeof(*gpu) );
++    gpu->uuid = *uuid;
++    gpu->vendor = vendor;
++    gpu->device = device;
++    gpu->last_ns = monotonic_ns();
++
++    if (vendor == 0x10de)
++    {
++        pthread_once( &nvml_once, nvml_init_once );
++        if (p_nvmlInit_v2)
++        {
++            const BYTE *b = (const BYTE *)uuid;
++            char str[64];
++
++            snprintf( str, sizeof(str), "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++                      b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15] );
++            if (p_nvmlDeviceGetHandleByUUID( str, &gpu->nvml )) gpu->nvml = NULL;
++            TRACE( "NVML device for %s: %p.\n", str, gpu->nvml );
++        }
++    }
++    if (!gpu->nvml) find_sysfs_device( gpu );
++    return gpu;
++}
++
++/* busy percentage of the main 3D engine, or -1 if unknown */
++static int sample_utilization( struct gpu_device *gpu )
++{
++    ULONGLONG value;
++
++    if (gpu->nvml)
++    {
++        nvmlUtilization_t util;
++        if (!p_nvmlDeviceGetUtilizationRates( gpu->nvml, &util )) return min( util.gpu, 100 );
++        return -1;
++    }
++    if (gpu->sysfs[0] && read_sysfs_ulonglong( gpu->sysfs, "gpu_busy_percent", &value )) return min( value, 100 );
++    return -1;
++}
++
++BOOL get_gpu_stats( const GUID *uuid, UINT vendor, UINT device, struct gpu_stats *stats )
++{
++    struct gpu_device *gpu;
++    ULONGLONG now, value;
++    char hwmon[1536];
++    int util;
++
++    memset( stats, 0, sizeof(*stats) );
++
++    pthread_mutex_lock( &gpustats_lock );
++    if (!(gpu = get_gpu_device( uuid, vendor, device )))
++    {
++        pthread_mutex_unlock( &gpustats_lock );
++        return FALSE;
++    }
++
++    /* integrate the sampled utilization into a cumulative running time */
++    now = monotonic_ns();
++    if ((util = sample_utilization( gpu )) >= 0)
++    {
++        gpu->running_time += (now - gpu->last_ns) / 100 * util / 100;
++        stats->flags |= GPU_STATS_RUNNING_TIME;
++    }
++    gpu->last_ns = now;
++    stats->running_time = gpu->running_time;
++
++    if (gpu->nvml)
++    {
++        nvmlMemory_t memory;
++        unsigned int temp, fan, power, limit, clock;
++
++        if (!p_nvmlDeviceGetMemoryInfo( gpu->nvml, &memory ))
++        {
++            stats->vram_used = memory.used;
++            stats->vram_total = memory.total;
++            stats->flags |= GPU_STATS_MEMORY;
++        }
++        if (!p_nvmlDeviceGetTemperature( gpu->nvml, NVML_TEMPERATURE_GPU, &temp ))
++        {
++            stats->temperature = temp * 10;
++            stats->flags |= GPU_STATS_TEMPERATURE;
++        }
++        /* NVML reports fan speed as a percentage of the maximum */
++        if (p_nvmlDeviceGetFanSpeed && !p_nvmlDeviceGetFanSpeed( gpu->nvml, &fan )) stats->fan_percent = fan;
++        if (p_nvmlDeviceGetPowerUsage && p_nvmlDeviceGetEnforcedPowerLimit &&
++            !p_nvmlDeviceGetPowerUsage( gpu->nvml, &power ) &&
++            !p_nvmlDeviceGetEnforcedPowerLimit( gpu->nvml, &limit ) && limit)
++            stats->power = (ULONGLONG)power * 1000 / limit;
++        if (p_nvmlDeviceGetClockInfo && !p_nvmlDeviceGetClockInfo( gpu->nvml, NVML_CLOCK_MEM, &clock ))
++            stats->memory_frequency = clock * 1000000ull;
++        if (p_nvmlDeviceGetMaxClockInfo && !p_nvmlDeviceGetMaxClockInfo( gpu->nvml, NVML_CLOCK_MEM, &clock ))
++            stats->max_memory_frequency = clock * 1000000ull;
++    }
++    else if (gpu->sysfs[0])
++    {
++        if (read_sysfs_ulonglong( gpu->sysfs, "mem_info_vram_used", &stats->vram_used ) &&
++            read_sysfs_ulonglong( gpu->sysfs, "mem_info_vram_total", &stats->vram_total ))
++            stats->flags |= GPU_STATS_MEMORY;
++        if (get_hwmon_dir( gpu->sysfs, hwmon, sizeof(hwmon) ))
++        {
++            if (read_sysfs_ulonglong( hwmon, "temp1_input", &value ))
++            {
++                stats->temperature = value / 100; /* millidegrees to decidegrees */
++                stats->flags |= GPU_STATS_TEMPERATURE;
++            }
++            if (read_sysfs_ulonglong( hwmon, "fan1_input", &value )) stats->fan_rpm = value;
++        }
++    }
++
++    pthread_mutex_unlock( &gpustats_lock );
++    return TRUE;
++}
+diff --git a/dlls/win32u/tests/d3dkmt.c b/dlls/win32u/tests/d3dkmt.c
+index 22deb7402d9..60c21b2c5d3 100644
+--- a/dlls/win32u/tests/d3dkmt.c
++++ b/dlls/win32u/tests/d3dkmt.c
+@@ -700,6 +700,70 @@ static void test_D3DKMTOpenAdapterFromHdc(void)
+     }
+ }
+ 
++static void test_D3DKMTQueryStatistics(void)
++{
++    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open_adapter_desc;
++    D3DKMT_QUERYADAPTERINFO query_adapter_info;
++    D3DKMT_CLOSEADAPTER close_adapter_desc;
++    D3DKMT_ADAPTER_PERFDATA perf;
++    D3DKMT_QUERYSTATISTICS stats;
++    LONGLONG running_time;
++    NTSTATUS status;
++    BOOL ret;
++
++    ret = get_primary_adapter_name( open_adapter_desc.DeviceName );
++    ok( ret, "Failed to get primary adapter name.\n" );
++    status = D3DKMTOpenAdapterFromGdiDisplayName( &open_adapter_desc );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++
++    memset( &stats, 0, sizeof(stats) );
++    stats.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
++    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
++    status = D3DKMTQueryStatistics( &stats );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++    ok( stats.QueryResult.AdapterInformation.NodeCount >= 1, "got %lu nodes.\n",
++        stats.QueryResult.AdapterInformation.NodeCount );
++    ok( stats.QueryResult.AdapterInformation.NbSegments >= 1, "got %lu segments.\n",
++        stats.QueryResult.AdapterInformation.NbSegments );
++
++    memset( &stats, 0, sizeof(stats) );
++    stats.Type = D3DKMT_QUERYSTATISTICS_NODE;
++    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
++    stats.QueryNode.NodeId = 0;
++    status = D3DKMTQueryStatistics( &stats );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++    running_time = stats.QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart;
++    Sleep( 50 );
++    status = D3DKMTQueryStatistics( &stats );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++    ok( stats.QueryResult.NodeInformation.GlobalInformation.RunningTime.QuadPart >= running_time,
++        "running time went backwards.\n" );
++
++    memset( &stats, 0, sizeof(stats) );
++    stats.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
++    stats.AdapterLuid = open_adapter_desc.AdapterLuid;
++    stats.QuerySegment.SegmentId = 0;
++    status = D3DKMTQueryStatistics( &stats );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++    ok( stats.QueryResult.SegmentInformation.BytesResident <= stats.QueryResult.SegmentInformation.CommitLimit ||
++        !stats.QueryResult.SegmentInformation.CommitLimit, "resident %I64u above limit %I64u.\n",
++        stats.QueryResult.SegmentInformation.BytesResident, stats.QueryResult.SegmentInformation.CommitLimit );
++
++    /* temperature is optional, drivers may not report it */
++    memset( &perf, 0, sizeof(perf) );
++    query_adapter_info.hAdapter = open_adapter_desc.hAdapter;
++    query_adapter_info.Type = KMTQAITYPE_ADAPTERPERFDATA;
++    query_adapter_info.pPrivateDriverData = &perf;
++    query_adapter_info.PrivateDriverDataSize = sizeof(perf);
++    status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++    ok( status == STATUS_SUCCESS || status == STATUS_NOT_SUPPORTED, "Got unexpected return code %#lx.\n", status );
++    if (!status) ok( perf.Temperature < 1500, "got temperature %lu.\n", perf.Temperature );
++
++    close_adapter_desc.hAdapter = open_adapter_desc.hAdapter;
++    status = D3DKMTCloseAdapter( &close_adapter_desc );
++    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++}
++
+ static void test_D3DKMTEnumAdapters2(void)
+ {
+     D3DKMT_ENUMADAPTERS2 enum_adapters_2_desc = {0};
+@@ -6771,6 +6835,7 @@ START_TEST( d3dkmt )
+     test_D3DKMTCheckOcclusion();
+     test_D3DKMTOpenAdapterFromDeviceName();
+     test_D3DKMTQueryAdapterInfo();
++    test_D3DKMTQueryStatistics();
+     test_D3DKMTQueryVideoMemoryInfo();
+     test_gpu_device_properties();
+     test_D3DKMTCreateSynchronizationObject();
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index cd6d06fdee3..cc26d4f89a2 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -201,6 +201,27 @@ extern void user_lock(void);
+ extern void user_unlock(void);
+ extern void user_check_not_lock(void);
+ extern BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid );
++
++/* gpustats.c */
++#define GPU_STATS_RUNNING_TIME  0x1
++#define GPU_STATS_MEMORY        0x2
++#define GPU_STATS_TEMPERATURE   0x4
++
++struct gpu_stats
++{
++    UINT      flags;
++    ULONGLONG running_time;         /* 3D engine busy time, in 100ns units */
++    ULONGLONG vram_used;
++    ULONGLONG vram_total;
++    UINT      temperature;          /* deci-Celsius */
++    UINT      fan_rpm;
++    UINT      fan_percent;
++    UINT      power;                /* tenths of a percent of the power limit */
++    ULONGLONG memory_frequency;     /* Hz */
++    ULONGLONG max_memory_frequency; /* Hz */
++};
++
++extern BOOL get_gpu_stats( const GUID *uuid, UINT vendor, UINT device, struct gpu_stats *stats );
+ extern BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name );
+ extern BOOL get_float_gamma_ramp( float *ramp, LONG *serial );
+ extern BOOL get_global_gamma_ramp( void *data );
+diff --git a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+index 9141b2528b7..ff4cde009b9 100644
+--- a/include/ddk/d3dkmthk.h
++++ b/include/ddk/d3dkmthk.h
+@@ -280,6 +280,30 @@ typedef enum _KMTQUERYADAPTERINFOTYPE
+     KMTQAITYPE_WDDM_3_1_CAPS
+ } KMTQUERYADAPTERINFOTYPE;
+ 
++typedef struct _D3DKMT_ADAPTER_PERFDATA
++{
++    UINT32    PhysicalAdapterIndex;
++    ULONGLONG MemoryFrequency;
++    ULONGLONG MaxMemoryFrequency;
++    ULONGLONG MaxMemoryFrequencyOC;
++    ULONGLONG MemoryBandwidth;
++    ULONGLONG PCIEBandwidth;
++    ULONG     FanRPM;
++    ULONG     Power;
++    ULONG     Temperature;
++    UCHAR     PowerStateOverride;
++} D3DKMT_ADAPTER_PERFDATA;
++
++typedef struct _D3DKMT_ADAPTER_PERFDATACAPS
++{
++    UINT32    PhysicalAdapterIndex;
++    ULONGLONG MaxMemoryBandwidth;
++    ULONGLONG MaxPCIEBandwidth;
++    ULONG     MaxFanRPM;
++    ULONG     TemperatureMax;
++    ULONG     TemperatureWarning;
++} D3DKMT_ADAPTER_PERFDATACAPS;
++
+ typedef struct _D3DKMT_QUERYADAPTERINFO
+ {
+     D3DKMT_HANDLE           hAdapter;

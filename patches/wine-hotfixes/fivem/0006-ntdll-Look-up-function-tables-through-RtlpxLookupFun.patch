@@ -1,7 +1,7 @@
 From 8deb9e41f975ea606c6d8796e7be23825a1439f6 Mon Sep 17 00:00:00 2001
 From: Stella Reine <stella@styna.net>
 Date: Fri, 16 Oct 2026 20:57:30 -0500
-Subject: [PATCH 6/6] ntdll: Look up function tables through
+Subject: [PATCH 6/8] ntdll: Look up function tables through
  RtlpxLookupFunctionTable on x86_64.
 
 Like Windows 8.1 and later, RtlLookupFunctionTable now makes exactly one

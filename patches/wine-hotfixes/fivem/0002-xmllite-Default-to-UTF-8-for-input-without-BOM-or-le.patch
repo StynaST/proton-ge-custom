@@ -1,7 +1,7 @@
 From 50d2fdf6d40cacee794fed585eb718e5b03b7f5d Mon Sep 17 00:00:00 2001
 From: Stella Reine <stella@styna.net>
 Date: Fri, 16 Oct 2026 20:33:32 -0500
-Subject: [PATCH 2/6] xmllite: Default to UTF-8 for input without BOM or
+Subject: [PATCH 2/8] xmllite: Default to UTF-8 for input without BOM or
  leading markup.
 
 Documents starting with whitespace were left with an unknown encoding,

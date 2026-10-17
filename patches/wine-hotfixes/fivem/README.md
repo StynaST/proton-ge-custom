@@ -12,5 +12,7 @@ fork, commits after "Apply GE-Proton11-9 preparation patches".
 | 0004 ntdll | NtQueryDebugFilterState, hookable DbgPrintEx filter |
 | 0005 ntdll | `_fltused` data export with LdrpDebugFlags 16 bytes before it |
 | 0006 ntdll | RtlLookupFunctionTable calls RtlpxLookupFunctionTable once (x86_64) |
+| 0007 win32u | D3DKMT statistics and adapter perf data from NVML / sysfs |
+| 0008 pdh | real CPU counters, GPU Engine / GPU Adapter Memory counters, raw counter arrays |
 
 Regenerate: `git -C wine format-patch --no-signature -o ../patches/wine-hotfixes/fivem <prep-commit>..fivem-linux`

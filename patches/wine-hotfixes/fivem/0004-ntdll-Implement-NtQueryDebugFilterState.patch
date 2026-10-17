@@ -1,7 +1,7 @@
 From ab3afce1e95af2871ed8bf225e5560d8eeb7b4ad Mon Sep 17 00:00:00 2001
 From: Stella Reine <stella@styna.net>
 Date: Fri, 16 Oct 2026 20:57:29 -0500
-Subject: [PATCH 4/6] ntdll: Implement NtQueryDebugFilterState.
+Subject: [PATCH 4/8] ntdll: Implement NtQueryDebugFilterState.
 
 No component filter is enabled without a kernel debugger. DbgPrintEx now
 also raises DBG_PRINTEXCEPTION_C when the filter state query reports a
