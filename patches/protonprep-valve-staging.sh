@@ -532,6 +532,10 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Add Bluetooth LE GATT and WinRT BLE support"
     apply_all_in_dir "../patches/wine-hotfixes/bluetooth-le/"
 
+    # FiveM: XAML Islands updater UI, loader compatibility (_fltused, RtlpxLookupFunctionTable)
+    echo "WINE: -FIVEM- FiveM client compatibility"
+    apply_all_in_dir "../patches/wine-hotfixes/fivem/"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

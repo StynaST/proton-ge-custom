@@ -1,0 +1,63 @@
+From 50d2fdf6d40cacee794fed585eb718e5b03b7f5d Mon Sep 17 00:00:00 2001
+From: Stella Reine <stella@styna.net>
+Date: Fri, 16 Oct 2026 20:33:32 -0500
+Subject: [PATCH 2/6] xmllite: Default to UTF-8 for input without BOM or
+ leading markup.
+
+Documents starting with whitespace were left with an unknown encoding,
+so the reader returned S_FALSE on the first Read. Per the XML spec,
+input without BOM or declaration is UTF-8; keep UTF-16 for input that
+looks like UTF-16LE.
+---
+ dlls/xmllite/reader.c       | 5 +++++
+ dlls/xmllite/tests/reader.c | 7 +++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/dlls/xmllite/reader.c b/dlls/xmllite/reader.c
+index 27d4fd014c1..b903e367537 100644
+--- a/dlls/xmllite/reader.c
++++ b/dlls/xmllite/reader.c
+@@ -920,6 +920,11 @@ static HRESULT readerinput_detectencoding(xmlreaderinput *readerinput, xml_encod
+         buffer->cur += sizeof(utf16lebom);
+         *enc = XmlEncoding_UTF16;
+     }
++    /* no BOM and no markup at the very start, e.g. leading whitespace */
++    else if (buffer->data[0] && !buffer->data[1])
++        *enc = XmlEncoding_UTF16;
++    else
++        *enc = XmlEncoding_UTF8;
+ 
+     return S_OK;
+ }
+diff --git a/dlls/xmllite/tests/reader.c b/dlls/xmllite/tests/reader.c
+index 0dd490ff989..7e3990f4c5b 100644
+--- a/dlls/xmllite/tests/reader.c
++++ b/dlls/xmllite/tests/reader.c
+@@ -2179,6 +2179,7 @@ static void test_encoding_detection(void)
+         { { '<','!','-','-',' ','c','-','-','>',0 } },
+         { { 0xfeff,'<','a','/','>',0 } },
+         { { '<','a','/','>',0 } },
++        { { '\n','<','a','/','>',0 } },
+     };
+     static const char *encoding_testsA[] =
+     {
+@@ -2186,6 +2187,8 @@ static void test_encoding_detection(void)
+         "<!-- comment -->",
+         "\xef\xbb\xbf<a/>", /* UTF-8 BOM */
+         "<a/>",
++        "\n<a/>", /* leading whitespace, no BOM or declaration */
++        " \t\r\n<a/>",
+     };
+     IXmlReader *reader;
+     XmlNodeType type;
+@@ -2223,6 +2226,10 @@ static void test_encoding_detection(void)
+         IStream_Release(stream);
+     }
+ 
++    set_input_string(reader, "\n<a/>");
++    read_node(reader, XmlNodeType_Whitespace);
++    read_node(reader, XmlNodeType_Element);
++
+     IXmlReader_Release(reader);
+ }
+ 

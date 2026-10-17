@@ -1,0 +1,116 @@
+From 928cabe4fb9fbecd62f33c57888bbba7e894f687 Mon Sep 17 00:00:00 2001
+From: Stella Reine <stella@styna.net>
+Date: Fri, 16 Oct 2026 20:57:29 -0500
+Subject: [PATCH 5/6] ntdll: Export _fltused as data next to the loader debug
+ flags.
+
+_fltused was a stub function, so its address pointed into code. FiveM
+reads and writes the loader debug flags 16 bytes before it on Windows 10
+builds 18362 to 19045 and crashed with a write fault. Export it as an
+int in .data preceded by LdrpDebugFlags, as on those builds, and report
+missing DLL imports through DbgPrintEx when loader error snaps are on.
+---
+ dlls/ntdll/loader.c    | 32 ++++++++++++++++++++++++++++++++
+ dlls/ntdll/ntdll.spec  |  2 +-
+ dlls/ntdll/tests/rtl.c | 18 ++++++++++++++++++
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index b63302a4334..2cae34a3e31 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -39,6 +39,36 @@
+ #include "ddk/wdm.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(module);
++
++/* Windows 10 builds 18362 to 19045 keep the loader debug flags 16 bytes
++ * before the _fltused data export; applications enable loader error
++ * reporting through that address (FiveM's HardErrorScope). */
++__ASM_BLOCK_BEGIN(ldr_debug_flags)
++asm( ".data\n\t"
++     ".balign 16\n"
++     __ASM_GLOBL(__ASM_NAME("LdrpDebugFlags")) "\n\t"
++     ".long 0, 0, 0, 0\n"
++     __ASM_GLOBL(__ASM_NAME("ntdll_fltused")) "\n\t"
++     ".long 0x9875\n\t"
++     ".text" );
++__ASM_BLOCK_END
++
++extern ULONG LdrpDebugFlags;
++
++#define LDR_DEBUG_SHOW_ERRORS 0x2
++#define DPFLTR_LDR_ID 85
++
++/* report loader errors through DbgPrintEx like the Windows loader does */
++static void WINAPIV ldr_report_error( const char *fmt, ... )
++{
++    va_list args;
++
++    if (!(LdrpDebugFlags & LDR_DEBUG_SHOW_ERRORS)) return;
++    va_start( args, fmt );
++    vDbgPrintExWithPrefix( "LDR: ", DPFLTR_LDR_ID, DPFLTR_ERROR_LEVEL, fmt, args );
++    va_end( args );
++}
++
+ WINE_DECLARE_DEBUG_CHANNEL(relay);
+ WINE_DECLARE_DEBUG_CHANNEL(snoop);
+ WINE_DECLARE_DEBUG_CHANNEL(loaddll);
+@@ -1231,6 +1261,8 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
+         else
+             ERR("Loading library %s (which is needed by %s) failed (error %lx).\n",
+                 name, debugstr_w(wm->ldr.FullDllName.Buffer), status);
++        ldr_report_error( "Unable to load DLL \"%s\" needed by \"%ls\", status 0x%08lx\n",
++                          name, wm->ldr.FullDllName.Buffer, status );
+         return FALSE;
+     }
+ 
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 104891ca52a..941fec84f33 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1561,7 +1561,7 @@
+ @ cdecl -norelay -arch=i386 -ret64 _aullshr(int64 long)
+ @ cdecl -arch=i386 -norelay _chkstk()
+ @ cdecl _errno()
+-@ stub _fltused
++@ extern _fltused ntdll_fltused
+ @ cdecl -arch=i386 -ret64 _ftol()
+ @ cdecl -arch=i386 -ret64 _ftol2() _ftol
+ @ cdecl -arch=i386 -ret64 _ftol2_sse() _ftol # FIXME
+diff --git a/dlls/ntdll/tests/rtl.c b/dlls/ntdll/tests/rtl.c
+index 421d7e6afbe..1e012aa105d 100644
+--- a/dlls/ntdll/tests/rtl.c
++++ b/dlls/ntdll/tests/rtl.c
+@@ -3579,6 +3579,23 @@ static void test_DbgPrint(void)
+     RtlRemoveVectoredExceptionHandler( handler );
+ }
+ 
++static void test_fltused(void)
++{
++    MEMORY_BASIC_INFORMATION info;
++    int *fltused;
++    SIZE_T size;
++
++    /* a data export; some applications also write next to it */
++    fltused = (int *)GetProcAddress( hntdll, "_fltused" );
++    ok( fltused != NULL, "_fltused not exported\n" );
++    if (!fltused) return;
++    ok( *fltused == 0x9875, "got %#x\n", *fltused );
++
++    size = VirtualQuery( fltused - 4, &info, sizeof(info) );
++    ok( size == sizeof(info), "VirtualQuery failed\n" );
++    ok( info.Protect == PAGE_READWRITE || info.Protect == PAGE_WRITECOPY, "got protection %#lx\n", info.Protect );
++}
++
+ static BOOL test_heap_destroy_dbgstr = FALSE;
+ static BOOL test_heap_destroy_break = FALSE;
+ 
+@@ -5581,6 +5598,7 @@ START_TEST(rtl)
+     test_RtlMakeSelfRelativeSD();
+     test_LdrRegisterDllNotification();
+     test_DbgPrint();
++    test_fltused();
+     test_RtlDestroyHeap();
+     test_RtlCreateHeap();
+     test_RtlFirstFreeAce();

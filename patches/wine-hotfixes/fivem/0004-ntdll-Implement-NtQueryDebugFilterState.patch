@@ -1,0 +1,98 @@
+From ab3afce1e95af2871ed8bf225e5560d8eeb7b4ad Mon Sep 17 00:00:00 2001
+From: Stella Reine <stella@styna.net>
+Date: Fri, 16 Oct 2026 20:57:29 -0500
+Subject: [PATCH 4/6] ntdll: Implement NtQueryDebugFilterState.
+
+No component filter is enabled without a kernel debugger. DbgPrintEx now
+also raises DBG_PRINTEXCEPTION_C when the filter state query reports a
+component as enabled, so applications hooking the export (as FiveM does
+for loader messages) receive the output like on Windows. The query is
+made through a pointer so the hook is not bypassed.
+---
+ dlls/ntdll/ntdll.spec |  6 +++---
+ dlls/ntdll/rtl.c      | 21 ++++++++++++++++++++-
+ include/winternl.h    |  1 +
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 32b1d5e3d6c..104891ca52a 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -33,7 +33,7 @@
+ @ varargs DbgPrintEx(long long str)
+ # @ stub DbgPrintReturnControlC
+ @ stub DbgPrompt
+-# @ stub DbgQueryDebugFilterState
++@ stdcall DbgQueryDebugFilterState(long long) NtQueryDebugFilterState
+ # @ stub DbgSetDebugFilterState
+ @ stdcall DbgUiConnectToDbg()
+ @ stdcall DbgUiContinue(ptr long)
+@@ -304,7 +304,7 @@
+ @ stdcall -syscall=0x003d NtQueryAttributesFile(ptr ptr)
+ # @ stub NtQueryBootEntryOrder
+ # @ stub NtQueryBootOptions
+-# @ stub NtQueryDebugFilterState
++@ stdcall NtQueryDebugFilterState(long long)
+ @ stdcall -syscall=0x0015 NtQueryDefaultLocale(long ptr)
+ @ stdcall -syscall=0x0044 NtQueryDefaultUILanguage(ptr)
+ @ stdcall -syscall=0x0035 NtQueryDirectoryFile(long long ptr ptr ptr ptr long long long ptr long)
+@@ -1377,7 +1377,7 @@
+ @ stdcall -private ZwQueryAttributesFile(ptr ptr) NtQueryAttributesFile
+ # @ stub ZwQueryBootEntryOrder
+ # @ stub ZwQueryBootOptions
+-# @ stub ZwQueryDebugFilterState
++@ stdcall -private ZwQueryDebugFilterState(long long) NtQueryDebugFilterState
+ @ stdcall -private ZwQueryDefaultLocale(long ptr) NtQueryDefaultLocale
+ @ stdcall -private ZwQueryDefaultUILanguage(ptr) NtQueryDefaultUILanguage
+ @ stdcall -private ZwQueryDirectoryFile(long long ptr ptr ptr ptr long long long ptr long) NtQueryDirectoryFile
+diff --git a/dlls/ntdll/rtl.c b/dlls/ntdll/rtl.c
+index efa84588684..cffff782c2d 100644
+--- a/dlls/ntdll/rtl.c
++++ b/dlls/ntdll/rtl.c
+@@ -85,6 +85,23 @@ NTSTATUS WINAPI vDbgPrintEx( ULONG id, ULONG level, LPCSTR fmt, va_list args )
+     return vDbgPrintExWithPrefix( "", id, level, fmt, args );
+ }
+ 
++/******************************************************************************
++ *	NtQueryDebugFilterState  [NTDLL.@]
++ *	ZwQueryDebugFilterState  [NTDLL.@]
++ *	DbgQueryDebugFilterState  [NTDLL.@]
++ */
++NTSTATUS WINAPI NtQueryDebugFilterState( ULONG id, ULONG level )
++{
++    TRACE( "id %lu, level %#lx.\n", id, level );
++
++    /* without a kernel debugger no component filter masks are enabled */
++    return FALSE;
++}
++
++/* called through a volatile pointer, so the query is never folded away and
++ * hooks on the export take effect */
++static NTSTATUS (WINAPI * volatile query_debug_filter_state)( ULONG, ULONG ) = NtQueryDebugFilterState;
++
+ /******************************************************************************
+  *	vDbgPrintExWithPrefix  [NTDLL.@]
+  */
+@@ -100,7 +117,9 @@ NTSTATUS WINAPI vDbgPrintExWithPrefix( LPCSTR prefix, ULONG id, ULONG level, LPC
+ 
+     WARN_(debugstr)(*end == '\n' ? "%08lx:%08lx: %s" : "%08lx:%08lx: %s\n", id, level_mask, buf);
+ 
+-    if (level_mask & (1 << DPFLTR_ERROR_LEVEL) && NtCurrentTeb()->Peb->BeingDebugged)
++    /* applications may enable a component filter to capture these, e.g. loader errors */
++    if ((level_mask & (1 << DPFLTR_ERROR_LEVEL) && NtCurrentTeb()->Peb->BeingDebugged) ||
++        query_debug_filter_state( id, level ) == TRUE)
+     {
+         __TRY
+         {
+diff --git a/include/winternl.h b/include/winternl.h
+index 70dca914b3d..bcc61bb0fe6 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -4780,6 +4780,7 @@ NTSYSAPI NTSTATUS  WINAPI NtQueueApcThread(HANDLE,PNTAPCFUNC,ULONG_PTR,ULONG_PTR
+ NTSYSAPI NTSTATUS  WINAPI NtQueueApcThreadEx(HANDLE,HANDLE,PNTAPCFUNC,ULONG_PTR,ULONG_PTR,ULONG_PTR);
+ NTSYSAPI NTSTATUS  WINAPI NtQueueApcThreadEx2(HANDLE,HANDLE,ULONG,PNTAPCFUNC,ULONG_PTR,ULONG_PTR,ULONG_PTR);
+ NTSYSAPI NTSTATUS  WINAPI NtQueryAttributesFile(const OBJECT_ATTRIBUTES*,FILE_BASIC_INFORMATION*);
++NTSYSAPI NTSTATUS  WINAPI NtQueryDebugFilterState(ULONG,ULONG);
+ NTSYSAPI NTSTATUS  WINAPI NtQueryDefaultLocale(BOOLEAN,LCID*);
+ NTSYSAPI NTSTATUS  WINAPI NtQueryDefaultUILanguage(LANGID*);
+ NTSYSAPI NTSTATUS  WINAPI NtQueryDirectoryFile(HANDLE,HANDLE,PIO_APC_ROUTINE,PVOID,PIO_STATUS_BLOCK,PVOID,ULONG,FILE_INFORMATION_CLASS,BOOLEAN,PUNICODE_STRING,BOOLEAN);
