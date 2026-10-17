@@ -1,0 +1,191 @@
+From 249aa6f2a0905f03ad9483440d45e8f6c5640e28 Mon Sep 17 00:00:00 2001
+From: Stella Reine <stella@styna.net>
+Date: Sat, 17 Oct 2026 00:53:22 -0500
+Subject: [PATCH] d3d11: Add option to preserve dynamic image contents across
+ discards.
+
+FiveM's Wine NUI path maps its 1919x1079 dynamic NUI texture with
+WRITE_DISCARD and then only rewrites the dirty rects reported by CEF.
+DXVK hands out fresh storage on each discard, so everything outside the
+latest dirty rects showed up black until it was damaged again (for
+example by hovering over it).
+
+d3d11.preserveDynamicImageContents initializes the storage returned by
+WRITE_DISCARD with the previously written data, both for directly
+mapped images and for images mapped through a staging buffer. Mapped
+memory for such images is host-cached so the copy stays cheap. Enable
+it for the FiveM game process.
+---
+ dxvk.conf                       |  9 +++++++++
+ src/d3d11/d3d11_context_imm.cpp | 10 +++++++++-
+ src/d3d11/d3d11_options.cpp     |  1 +
+ src/d3d11/d3d11_options.h       |  5 +++++
+ src/d3d11/d3d11_texture.cpp     | 29 +++++++++++++++++++++++++++--
+ src/d3d11/d3d11_texture.h       |  4 ++++
+ src/util/config/config.cpp      |  7 +++++++
+ 7 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/dxvk.conf b/dxvk.conf
+index 584f7a6c..773c857b 100644
+--- a/dxvk.conf
++++ b/dxvk.conf
+@@ -409,6 +409,15 @@
+ # d3d11.cachedDynamicResources = ""
+ 
+ 
++# Initializes the memory returned by WRITE_DISCARD maps of dynamic textures
++# with the data written by the previous map. Works around applications
++# that only rewrite the changed region of a discarded dynamic texture.
++#
++# Supported values: True, False
++
++# d3d11.preserveDynamicImageContents = False
++
++
+ # Disables direct image mapping. This is used to work around bugs
+ # where the game ignores the implementation-defined row pitch for
+ # mapped dynamic images and expects it to be tightly packed, which
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index b21f2932..59d455d3 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -497,9 +497,17 @@ namespace dxvk {
+       Rc<DxvkImage> mappedImage = pResource->GetImage();
+ 
+       if (MapType == D3D11_MAP_WRITE_DISCARD) {
++        void* prevData = pResource->GetMapPtr(Subresource, 0);
++        auto storage = pResource->DiscardStorage();
++
++        // The previous storage stays alive until the CS thread has
++        // processed this invalidation, so it is safe to read here.
++        if (m_parent->GetOptions()->preserveDynamicImageContents && prevData)
++          std::memcpy(storage->mapPtr(), prevData, layout.Offset + layout.Size);
++
+         EmitCs([
+           cImage = std::move(mappedImage),
+-          cStorage = pResource->DiscardStorage()
++          cStorage = std::move(storage)
+         ] (DxvkContext* ctx) {
+           ctx->invalidateImage(cImage, Rc<DxvkResourceAllocation>(cStorage), VK_IMAGE_LAYOUT_PREINITIALIZED);
+         });
+diff --git a/src/d3d11/d3d11_options.cpp b/src/d3d11/d3d11_options.cpp
+index 84cfbf50..24eb148a 100644
+--- a/src/d3d11/d3d11_options.cpp
++++ b/src/d3d11/d3d11_options.cpp
+@@ -30,6 +30,7 @@ namespace dxvk {
+     this->reproducibleCommandStream = config.getOption<bool>("d3d11.reproducibleCommandStream", false);
+     this->disableDirectImageMapping = config.getOption<bool>("d3d11.disableDirectImageMapping", false);
+     this->ignoreExplicitFlush   = config.getOption<bool>("d3d11.ignoreExplicitFlush", false);
++    this->preserveDynamicImageContents = config.getOption<bool>("d3d11.preserveDynamicImageContents", false);
+ 
+     // Clamp LOD bias so that people don't abuse this in unintended ways
+     this->samplerLodBias = dxvk::fclamp(this->samplerLodBias, -2.0f, 1.0f);
+diff --git a/src/d3d11/d3d11_options.h b/src/d3d11/d3d11_options.h
+index 0cd87db1..6c6080d0 100644
+--- a/src/d3d11/d3d11_options.h
++++ b/src/d3d11/d3d11_options.h
+@@ -83,6 +83,11 @@ namespace dxvk {
+     /// an api trace.
+     uint32_t cachedDynamicResources = 0;
+ 
++    /// Initialize the memory returned by WRITE_DISCARD maps of dynamic
++    /// images with the previously written data. Works around applications
++    /// that only rewrite the changed parts of a discarded dynamic texture.
++    bool preserveDynamicImageContents = false;
++
+     /// Always lock immediate context on every API call. May be
+     /// useful for debugging purposes or when applications have
+     /// race conditions.
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index 2da6f5c5..d1eef6ef 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -598,7 +598,8 @@ namespace dxvk {
+ 
+     bool useCached = (m_device->GetOptions()->cachedDynamicResources == ~0u)
+                   || (m_device->GetOptions()->cachedDynamicResources & m_desc.BindFlags)
+-                  || (m_desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ);
++                  || (m_desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ)
++                  || (m_device->GetOptions()->preserveDynamicImageContents);
+ 
+     if (m_desc.Usage == D3D11_USAGE_STAGING || useCached)
+       memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+@@ -872,20 +873,44 @@ namespace dxvk {
+     VkMemoryPropertyFlags memType = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+     
+-    bool useCached = m_device->GetOptions()->cachedDynamicResources == ~0u;
++    bool preserve = m_desc.Usage == D3D11_USAGE_DYNAMIC
++      && m_device->GetOptions()->preserveDynamicImageContents;
++    bool useCached = m_device->GetOptions()->cachedDynamicResources == ~0u || preserve;
+ 
+     if (m_desc.Usage == D3D11_USAGE_STAGING || useCached)
+       memType |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+ 
+     auto& entry = m_buffers[Subresource];
++
++    if (preserve && entry.retainedBuffer != nullptr
++     && !entry.retainedBuffer->isInUse(DxvkAccess::Read)) {
++      // The previous upload has completed, so the buffer can be reused as-is
++      entry.buffer = std::move(entry.retainedBuffer);
++      entry.slice = std::move(entry.retainedSlice);
++      return;
++    }
++
+     entry.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType);
+     entry.slice = entry.buffer->storage();
++
++    if (preserve && entry.retainedBuffer != nullptr) {
++      std::memcpy(entry.slice->mapPtr(), entry.retainedSlice->mapPtr(), info.size);
++      entry.retainedBuffer = nullptr;
++      entry.retainedSlice = nullptr;
++    }
+   }
+ 
+ 
+   void D3D11CommonTexture::FreeMappedBuffer(
+           UINT                  Subresource) {
+     auto& entry = m_buffers[Subresource];
++
++    if (m_desc.Usage == D3D11_USAGE_DYNAMIC
++     && m_device->GetOptions()->preserveDynamicImageContents) {
++      entry.retainedBuffer = std::move(entry.buffer);
++      entry.retainedSlice = std::move(entry.slice);
++    }
++
+     entry.buffer = nullptr;
+     entry.slice = nullptr;
+   }
+diff --git a/src/d3d11/d3d11_texture.h b/src/d3d11/d3d11_texture.h
+index 589603cf..f5a44141 100644
+--- a/src/d3d11/d3d11_texture.h
++++ b/src/d3d11/d3d11_texture.h
+@@ -564,6 +564,10 @@ namespace dxvk {
+       Rc<DxvkBuffer>              buffer;
+       Rc<DxvkResourceAllocation>  slice;
+ 
++      /* last unmapped buffer of a dynamic image, see preserveDynamicImageContents */
++      Rc<DxvkBuffer>              retainedBuffer;
++      Rc<DxvkResourceAllocation>  retainedSlice;
++
+       std::vector<D3D11_COMMON_TEXTURE_REGION> dirtyRegions;
+     };
+ 
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index 8dfb3002..86bf6563 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -389,6 +389,13 @@ namespace dxvk {
+     { R"(\\GTA5\.exe$)", {{
+       { "d3d11.cachedDynamicResources",       "vi" },
+     }} },
++    /* FiveM: game process launched by the FiveM client.  *
++     * Its Wine NUI path rewrites only the dirty rects of  *
++     * a WRITE_DISCARD mapped dynamic texture              */
++    { R"(\\FiveM_(b[0-9]+_)?(GameProcess|GTAProcess)\.exe$)", {{
++      { "d3d11.cachedDynamicResources",       "vi" },
++      { "d3d11.preserveDynamicImageContents", "True" },
++    }} },
+     /* Crash Bandicoot N. Sane Trilogy            *
+      * Work around some vsync funkiness           */
+     { R"(\\CrashBandicootNSaneTrilogy\.exe$)", {{

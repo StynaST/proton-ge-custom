@@ -14,5 +14,6 @@ fork, commits after "Apply GE-Proton11-9 preparation patches".
 | 0006 ntdll | RtlLookupFunctionTable calls RtlpxLookupFunctionTable once (x86_64) |
 | 0007 win32u | D3DKMT statistics and adapter perf data from NVML / sysfs |
 | 0008 pdh | real CPU counters, GPU Engine / GPU Adapter Memory counters, raw counter arrays |
+| 0009 win32u | desktop window creation no longer loads the display driver (explorer/desktop deadlock) |
 
 Regenerate: `git -C wine format-patch --no-signature -o ../patches/wine-hotfixes/fivem <prep-commit>..fivem-linux`

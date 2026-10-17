@@ -39,6 +39,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
+    # FiveM: NUI rewrites only dirty rects of a WRITE_DISCARD mapped dynamic texture.
+    apply_patch "../patches/dxvk/fivem-preserve-dynamic-image-contents.patch"
     popd
 
     pushd vkd3d-proton
